@@ -110,7 +110,9 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(ProjectDir)lib\bin\debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>$(CoreLibraryDependencies);PhysXFoundation_64.lib;PhysXCommon_64.lib;PhysX_64.lib;PhysXCooking_64.lib;PhysXExtensions_static_64.lib;PVDRuntime_64.lib;PhysXPvdSDK_static_64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(CoreLibraryDependencies);PhysXFoundation_64.lib;PhysXCommon_64.lib;PhysX_64.lib;PhysXCooking_64.lib;PhysXExtensions_static_64.lib;PVDRuntime_64.lib;PhysXPvdSDK_static_64.lib;freeglut.lib;freeglutd.lib;freeglut_static.lib;freeglut_staticd.lib;LowLevelAABB_static_64.lib;LowLevelDynamics_static_64.lib;LowLevel_static_64.lib;PhysXCharacterKinematic_static_64.lib;PhysXCudaContextManager_static_64.lib;PhysXTask_static_64.lib;PhysXVehicle2_static_64.lib;SceneQuery_static_64.lib;SimulationController_static_64.lib;SnippetRender_static_64.lib;SnippetUtils_static_64.lib;cuda.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ShowProgress>LinkVerbose</ShowProgress>
+      <AdditionalOptions>/VERBOSE:LIB %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /y "$(ProjectDir)lib\bin\$(Configuration)\*.dll" "$(OutDir)" 2&gt;nul</Command>
@@ -139,6 +141,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Test1.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="deleters.h" />
+    <ClInclude Include="resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Test1.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

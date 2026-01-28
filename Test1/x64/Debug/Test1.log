@@ -1,8 +1,18 @@
-﻿  Test1.vcxproj -> F:\PhysXApps\Test\x64\Debug\Test1.exe
+﻿  Test1.cpp
+F:\PhysXApps\Test\Test1\Test1.cpp(59,5): warning C4060: switch statement contains no 'case' or 'default' labels
+  LINK : 0 new modules and 1 (out of 375) modules have changed since prior linking
+  Starting pass 2
+       Test1.obj
+       LIBCMTD.lib(loadcfg.obj)
+  Finished pass 2
+  Test1.vcxproj -> F:\PhysXApps\Test\x64\Debug\Test1.exe
+  'pwsh.exe' is not recognized as an internal or external command,
+  operable program or batch file.
+  F:\PhysXApps\Test\Test1\lib\bin\Debug\freeglut.dll
   F:\PhysXApps\Test\Test1\lib\bin\Debug\freeglutd.dll
   F:\PhysXApps\Test\Test1\lib\bin\Debug\PhysXCommon_64.dll
   F:\PhysXApps\Test\Test1\lib\bin\Debug\PhysXCooking_64.dll
   F:\PhysXApps\Test\Test1\lib\bin\Debug\PhysXFoundation_64.dll
   F:\PhysXApps\Test\Test1\lib\bin\Debug\PhysX_64.dll
   F:\PhysXApps\Test\Test1\lib\bin\Debug\PVDRuntime_64.dll
-  6 File(s) copied
+  7 File(s) copied
