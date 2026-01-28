@@ -1,0 +1,53 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "F:\\PhysXApps\\Test\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{4FFE1ABA-7512-4545-BF9A-1C4D5AA48960}|Test1\\Test1.vcxproj|F:\\PhysXApps\\Test\\Test1\\Test1.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{4FFE1ABA-7512-4545-BF9A-1C4D5AA48960}|Test1\\Test1.vcxproj|solutionrelative:Test1\\Test1.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 3,
+          "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{aa2115a1-9712-457b-9047-dbb71ca2cdd2}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{3ae79031-e1bc-11d0-8f78-00a0c9110057}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{40ea2e6b-2121-4bb8-a43e-c83c04b51041}"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "Test1.cpp",
+              "DocumentMoniker": "F:\\PhysXApps\\Test\\Test1\\Test1.cpp",
+              "RelativeDocumentMoniker": "Test1\\Test1.cpp",
+              "ToolTip": "F:\\PhysXApps\\Test\\Test1\\Test1.cpp",
+              "RelativeToolTip": "Test1\\Test1.cpp",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAA0AAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
+              "WhenOpened": "2026-01-21T17:46:24.973Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{cce594b6-0c39-4442-ba28-10c64ac7e89f}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

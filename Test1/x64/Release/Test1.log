@@ -1,0 +1,4 @@
+﻿  Test1.cpp
+F:\PhysXApps\Test\Test1\lib\include\foundation\PxPreprocessor.h(444,1): error C1189: #error:  Exactly one of NDEBUG and _DEBUG needs to be defined!
+  (compiling source file 'Test1.cpp')
+  
