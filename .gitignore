@@ -1,2 +1,4 @@
 *.ipch*.ipch
 .vs/
+.vs/
+*.ipch
