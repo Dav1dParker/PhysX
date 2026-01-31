@@ -3,26 +3,10 @@
 #include <memory>
 #include "snippetrender/SnippetRender.h"
 #include "snippetrender/SnippetCamera.h"
+#include "deleters.h"
 
 
-//struct PxFoundationDeleter {
-//    void operator()(physx::PxFoundation* p) const noexcept {
-//        if (p) p->release();
-//    }
-//};
-//
-//struct PxPhysicsDeleter {
-//    void operator()(physx::PxPhysics* p) const noexcept {
-//        if (p) p->release();
-//    }
-//};
-//
-//
-//struct PxSceneDeleter {
-//    void operator()(physx::PxScene* p) const noexcept {
-//        if (p) p->release();
-//    }
-//};
+
 
 
 
@@ -31,32 +15,36 @@ static physx::PxDefaultAllocator allocator;
 static physx::PxDefaultErrorCallback errorCallback;
 static bool gDidCleanup = false;
 
-physx::PxFoundation* foundation = nullptr;
-physx::PxPhysics* physics = nullptr;
-physx::PxScene* scene = nullptr;
-physx::PxPvd* pvd = nullptr;
-physx::PxPvdTransport* transport = nullptr;
-physx::PxDefaultCpuDispatcher* cpuDispatcher = nullptr;
-Snippets::Camera* camera = nullptr;
+struct AppState {
+    std::unique_ptr<physx::PxFoundation, PxFoundationDeleter> foundation;
+    std::unique_ptr<physx::PxPhysics, PxPhysicsDeleter> physics;
+    std::unique_ptr<physx::PxScene, PxSceneDeleter> scene;
+    std::unique_ptr<physx::PxPvd, PxPvdDeleter> pvd;
+    std::unique_ptr<physx::PxPvdTransport, PxPvdTransportDeleter> transport;
+    std::unique_ptr<physx::PxDefaultCpuDispatcher, PxDefaultCpuDispatcherDeleter> cpuDispatcher;
+    std::unique_ptr<Snippets::Camera> camera;
+    physx::PxArray<physx::PxRigidActor*> actors;
+};
 
-physx::PxArray<physx::PxRigidActor*> actors;
 
-
+static AppState* gApp = nullptr;
 static int gFrameCount = 0;
 static const int gMaxFrames = 600;
 static bool gExitRequested = false;
+static int cpuCoresCount = 2;
 
 
 
 void keyPress(unsigned char key, const physx::PxTransform& camera)
 {
+    /*auto& app = gApp;
     switch (toupper(key))
     {
-        if (actors.size() > 1)
+        if (app.actors.size() > 1)
         {
-            ((physx::PxRigidDynamic*)actors[1])->addForce(physx::PxVec3(1.0f, 1.0f, 1.0f));
+            ((physx::PxRigidDynamic*)app.actors[1])->addForce(physx::PxVec3(1.0f, 1.0f, 1.0f));
         }
-    }
+    }*/
 }
 
 void initPhysics()
@@ -68,42 +56,44 @@ void initPhysics()
 
     //std::unique_ptr<physx::PxFoundation, PxFoundationDeleter> foundation(PxCreateFoundation(PX_PHYSICS_VERSION, allocator, errorCallback));
 
-    foundation = PxCreateFoundation(PX_PHYSICS_VERSION, allocator, errorCallback);
-    if (!foundation) {
+    auto& app = *gApp;
+
+    app.foundation.reset(PxCreateFoundation(PX_PHYSICS_VERSION, allocator, errorCallback));
+    if (!app.foundation) {
         std::cerr << "PxCreateFoundation failed\n";
         std::abort();
     }
 
 
-    pvd = physx::PxCreatePvd(*foundation);
-    transport = physx::PxDefaultPvdSocketTransportCreate("127.0.0.1", 5425, 10000);
+    app.pvd.reset(physx::PxCreatePvd(*app.foundation));
+    app.transport.reset(physx::PxDefaultPvdSocketTransportCreate("127.0.0.1", 5425, 10000));
 
-    if (pvd && transport) {
-        if (!pvd->connect(*transport, physx::PxPvdInstrumentationFlag::eALL)) {
+    if (app.pvd && app.transport) {
+        if (!app.pvd->connect(*app.transport, physx::PxPvdInstrumentationFlag::eALL)) {
             std::cerr << "PVD connect failed\n";
         }
     }
 
-    physics = PxCreatePhysics(PX_PHYSICS_VERSION, *foundation, physx::PxTolerancesScale(), true, pvd);
-    if (!physics) {
+    app.physics.reset(PxCreatePhysics(PX_PHYSICS_VERSION, *app.foundation, physx::PxTolerancesScale(), true, app.pvd.get()));
+    if (!app.physics) {
         std::cerr << "PxCreatePhysics failed\n";
         std::abort();
     }
 
-    physx::PxSceneDesc sceneDesc(physics->getTolerancesScale());
+    physx::PxSceneDesc sceneDesc(app.physics->getTolerancesScale());
     sceneDesc.gravity = physx::PxVec3(0.0f, -9.81f, 0.0f);
 
-    cpuDispatcher = physx::PxDefaultCpuDispatcherCreate(2);
-    if (!cpuDispatcher) {
+    app.cpuDispatcher.reset(physx::PxDefaultCpuDispatcherCreate(cpuCoresCount));
+    if (!app.cpuDispatcher) {
         std::cerr << "Dispatcher create failed\n";
         std::abort();
     }
 
-    sceneDesc.cpuDispatcher = cpuDispatcher;
+    sceneDesc.cpuDispatcher = app.cpuDispatcher.get();
     sceneDesc.filterShader = physx::PxDefaultSimulationFilterShader;
 
-    scene = physics->createScene(sceneDesc);
-    if (!scene) {
+    app.scene.reset(app.physics->createScene(sceneDesc));
+    if (!app.scene) {
         std::cerr << "createScene failed\n";
         std::abort();
     }
@@ -121,68 +111,76 @@ void initPhysics()
     //std::unique_ptr<physx::PxScene, PxSceneDeleter> scene(physics->createScene(sceneDesc));
 
 
-    if (pvd && pvd->isConnected()) {
-        physx::PxPvdSceneClient* pvdClient = scene->getScenePvdClient();
+    if (app.pvd && app.pvd->isConnected()) {
+        physx::PxPvdSceneClient* pvdClient = app.scene->getScenePvdClient();
         if (pvdClient) {
             pvdClient->setScenePvdFlag(physx::PxPvdSceneFlag::eTRANSMIT_CONSTRAINTS, true);
             pvdClient->setScenePvdFlag(physx::PxPvdSceneFlag::eTRANSMIT_CONTACTS, true);
             pvdClient->setScenePvdFlag(physx::PxPvdSceneFlag::eTRANSMIT_SCENEQUERIES, true);
         }
     }
-
-    physx::PxMaterial* rockMaterial = physics->createMaterial(0.5f, 0.5f, 0.1f);
-    physx::PxMaterial* metalMaterial = physics->createMaterial(0.15f, 0.15f, 0.1f);
-    physx::PxMaterial* iceMaterial = physics->createMaterial(0.028f, 0.028f, 0.1f);
+    std::unique_ptr<physx::PxMaterial, PxMaterialDeleter> rockMaterial{app.physics->createMaterial(0.5f, 0.5f, 0.1f)};
+    std::unique_ptr<physx::PxMaterial, PxMaterialDeleter> metalMaterial{ app.physics->createMaterial(0.15f, 0.15f, 0.1f) };
+    std::unique_ptr<physx::PxMaterial, PxMaterialDeleter> iceMaterial{ app.physics->createMaterial(0.028f, 0.028f, 0.1f) };
 
 
     const physx::PxVec3 planeNormal = physx::PxVec3(0.4f, 1.0f, 0.0f).getNormalized();
     physx::PxPlane plane = physx::PxPlane(planeNormal, 0.0f);
 
-    physx::PxRigidStatic* groundActor = physx::PxCreatePlane(*physics, plane, *rockMaterial);
+    //physx::PxRigidStatic* groundActor = physx::PxCreatePlane(*app.physics, plane, *rockMaterial);
+    physx::PxRigidStatic* groundActor = physx::PxCreatePlane(*app.physics, plane, *rockMaterial);
 
-    scene->addActor(*groundActor);
-    actors.pushBack(groundActor);
+    app.scene->addActor(*groundActor);
+    app.actors.pushBack(groundActor);
 
     physx::PxBoxGeometry boxGeometry = physx::PxBoxGeometry(physx::PxVec3(0.5f, 0.5f, 0.5f));
 
-    physx::PxShape* boxShape1 = physics->createShape(boxGeometry, *metalMaterial, true);
-    physx::PxRigidDynamic* boxActor1 = physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 10.0f, 0.0f)));
+    std::unique_ptr<physx::PxShape, PxShapeDeleter> boxShape1{ app.physics->createShape(boxGeometry, *metalMaterial, false) };
+    physx::PxRigidDynamic* boxActor1 = app.physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 10.0f, 0.0f)));
     boxActor1->attachShape(*boxShape1);
     physx::PxRigidBodyExt::updateMassAndInertia(*boxActor1, 10.0f);
-    scene->addActor(*boxActor1);
-    actors.pushBack(boxActor1);
+    app.scene->addActor(*boxActor1);
+    app.actors.pushBack(boxActor1);
 
 
-    physx::PxShape* boxShape2 = physics->createShape(boxGeometry, *iceMaterial, true);
+    /*physx::PxShape* boxShape2 = physics->createShape(boxGeometry, *iceMaterial, true);
     physx::PxRigidDynamic* boxActor2 = physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 10.0f, 5.0f)));
     boxActor2->attachShape(*boxShape2);
     physx::PxRigidBodyExt::updateMassAndInertia(*boxActor2, 10.0f);
     scene->addActor(*boxActor2);
-    actors.pushBack(boxActor2);
+    actors.pushBack(boxActor2);*/
+
+    std::unique_ptr<physx::PxShape, PxShapeDeleter> boxShape2{ app.physics->createShape(boxGeometry, *iceMaterial, false) };
+    physx::PxRigidDynamic* boxActor2 = app.physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 10.0f, 5.0f)));
+    boxActor2->attachShape(*boxShape2);
+    physx::PxRigidBodyExt::updateMassAndInertia(*boxActor2, 10.0f);
+    app.scene->addActor(*boxActor2);
+    app.actors.pushBack(boxActor2);
 
 
-    physx::PxShape* boxShape3 = physics->createShape(boxGeometry, *rockMaterial, true);
-    physx::PxRigidDynamic* boxActor3 = physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 10.0f, 10.0f)));
+    std::unique_ptr<physx::PxShape, PxShapeDeleter> boxShape3{ app.physics->createShape(boxGeometry, *rockMaterial, false) };
+    physx::PxRigidDynamic* boxActor3 = app.physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 10.0f, 10.0f)));
     boxActor3->attachShape(*boxShape3);
     physx::PxRigidBodyExt::updateMassAndInertia(*boxActor3, 10.0f);
-    scene->addActor(*boxActor3);
-    actors.pushBack(boxActor3);
+    app.scene->addActor(*boxActor3);
+    app.actors.pushBack(boxActor3);
 
 }
 
 
 void renderCallback()
 {
-    if (!scene) return;
+    auto& app = *gApp;
+    if (!app.scene) return;
 
-    scene->simulate(1.0f / 60.0f);
-    scene->fetchResults(true);
+    app.scene->simulate(1.0f / 60.0f);
+    app.scene->fetchResults(true);
 
-    Snippets::startRender(camera);
+    Snippets::startRender(app.camera.get());
 
-    if (actors.size() > 0)
+    if (app.actors.size() > 0)
     {
-        Snippets::renderActors(&actors[0], static_cast<uint32_t>(actors.size()), true);
+        Snippets::renderActors(&app.actors[0], static_cast<uint32_t>(app.actors.size()), true);
     }
 
     Snippets::finishRender();
@@ -199,43 +197,38 @@ void renderCallback()
 
 void exitCallback()
 {
+    auto& app = *gApp;
+
     if (gDidCleanup) return;
     gDidCleanup = true;
 
-    delete camera;
-    camera = nullptr;
-
-    // Release actors (optional, but safe if done once)
-    for (physx::PxRigidActor* a : actors)
+    for (physx::PxRigidActor* a : app.actors) {
         if (a) a->release();
-    actors.clear();
+    }
+    app.actors.clear();
 
-    if (scene) { scene->release(); scene = nullptr; }
-
-    if (cpuDispatcher) { cpuDispatcher->release(); cpuDispatcher = nullptr; }
-
-    PxCloseExtensions();
-
-    if (physics) { physics->release(); physics = nullptr; }
-
-    if (pvd)
+    if (app.pvd)
     {
-        pvd->disconnect(); // safe
-        pvd->release();
-        pvd = nullptr;
+        app.pvd->disconnect();
     }
 
-    if (transport) { transport->release(); transport = nullptr; }
-
-    if (foundation) { foundation->release(); foundation = nullptr; }
+    app.scene.reset();
+    app.cpuDispatcher.reset();
+    app.physics.reset();
+    app.pvd.reset();
+    app.transport.reset();
+    PxCloseExtensions();
+    app.foundation.reset();
 }
 
 
 
 int main()
 {
-    camera = new Snippets::Camera(physx::PxVec3(0.0f, 20.0f, 20.0f), physx::PxVec3(0.0f, -1.0f, -1.0f));
-    Snippets::setupDefault("PhysX test", camera, keyPress, renderCallback, exitCallback);
+    AppState app;
+    gApp = &app;
+    app.camera = std::make_unique<Snippets::Camera>(physx::PxVec3(0.0f, 20.0f, 20.0f), physx::PxVec3(0.0f, -1.0f, -1.0f));
+    Snippets::setupDefault("PhysX test", app.camera.get(), keyPress, renderCallback, exitCallback);
     initPhysics();
     glutMainLoop();
     //scene->release();
