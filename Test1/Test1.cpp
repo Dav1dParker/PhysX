@@ -3,10 +3,24 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <conio.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/select.h>
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 using namespace physx;
 
@@ -24,6 +38,8 @@ static PxMaterialPtr gBallMaterial;
 static PxMaterialPtr gRailMaterial;
 static PxMaterialPtr gCueMaterial;
 
+static constexpr float PI = 3.14159265358979323846f;
+
 static constexpr float TABLE_LENGTH = 2.54f;
 static constexpr float TABLE_WIDTH = 1.27f;
 
@@ -34,6 +50,14 @@ static constexpr float RAIL_HEIGHT = 0.12f;
 static constexpr float RAIL_THICKNESS = 0.08f;
 
 static constexpr float POCKET_RADIUS = 0.06f;
+static constexpr float POCKET_RADIUS_SQ = POCKET_RADIUS * POCKET_RADIUS;
+static constexpr float STOP_SPEED = 0.006f;
+
+static constexpr float MIN_SHOT_POWER = 0.20f;
+static constexpr float DEFAULT_SHOT_POWER = 1.10f;
+static constexpr float MAX_SHOT_POWER = 3.20f;
+static constexpr float SHOT_POWER_CHANGE_PER_SECOND = 1.60f;
+static constexpr float AIM_CHANGE_PER_SECOND = 120.0f * PI / 180.0f;
 
 static constexpr float TIME_STEP = 1.0f / 60.0f;
 
@@ -50,11 +74,76 @@ static std::vector<PxRigidStaticPtr> gStaticActors;
 static std::vector<PxVec3> gPocketPositions;
 static std::vector<std::string> gActorNames;
 
+static float gAimAngle = 0.0f;
+static float gShotPower = DEFAULT_SHOT_POWER;
+static bool  gGameOver = false;
+static bool  gPlayerWon = false;
+static bool  gCueBallPocketed = false;
+static bool  gQuitRequested = false;
+
 static const char* storeName(const std::string& value)
 {
     gActorNames.push_back(value);
     return gActorNames.back().c_str();
 }
+
+static int readKeyNonBlocking()
+{
+#ifdef _WIN32
+    if (_kbhit())
+        return _getch();
+    return -1;
+#else
+    struct TerminalGuard
+    {
+        termios oldState{};
+
+        TerminalGuard()
+        {
+            tcgetattr(STDIN_FILENO, &oldState);
+
+            termios newState = oldState;
+            newState.c_lflag &= static_cast<unsigned int>(~(ICANON | ECHO));
+            tcsetattr(STDIN_FILENO, TCSANOW, &newState);
+
+            int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+            fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+        }
+
+        ~TerminalGuard()
+        {
+            tcsetattr(STDIN_FILENO, TCSANOW, &oldState);
+        }
+    };
+
+    static TerminalGuard guard;
+
+    unsigned char ch = 0;
+    ssize_t n = read(STDIN_FILENO, &ch, 1);
+    if (n == 1)
+        return static_cast<int>(ch);
+
+    return -1;
+#endif
+}
+
+#ifdef _WIN32
+static bool wasVirtualKeyPressed(int virtualKey)
+{
+    static bool previousState[256] = {};
+
+    const bool pressed = (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+    const bool pressedThisFrame = pressed && !previousState[virtualKey];
+    previousState[virtualKey] = pressed;
+
+    return pressedThisFrame;
+}
+
+static bool isVirtualKeyDown(int virtualKey)
+{
+    return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+}
+#endif
 
 static PxRigidStaticPtr createStaticBox(
     const PxVec3& position,
@@ -188,6 +277,13 @@ static void resetBalls()
 {
     removeAllBalls();
 
+    gGameOver = false;
+    gPlayerWon = false;
+    gCueBallPocketed = false;
+
+    gAimAngle = 0.0f;
+    gShotPower = DEFAULT_SHOT_POWER;
+
     Ball cueBall;
     cueBall.actor = createBallActor(PxVec3(-0.72f, BALL_RADIUS, 0.0f), 0, true);
     cueBall.number = 0;
@@ -219,6 +315,227 @@ static void resetBalls()
             ++number;
         }
     }
+}
+
+static Ball* getCueBall()
+{
+    for (Ball& ball : gBalls)
+    {
+        if (ball.cue)
+            return &ball;
+    }
+
+    return nullptr;
+}
+
+static bool allBallsStopped()
+{
+    for (const Ball& ball : gBalls)
+    {
+        if (ball.pocketed || !ball.actor)
+            continue;
+
+        const PxVec3 v = ball.actor->getLinearVelocity();
+        const PxVec3 w = ball.actor->getAngularVelocity();
+
+        if (v.magnitude() > STOP_SPEED)
+            return false;
+
+        if (w.magnitude() > 1.0f)
+            return false;
+    }
+
+    return true;
+}
+
+static int remainingObjectBalls()
+{
+    int count = 0;
+
+    for (const Ball& ball : gBalls)
+    {
+        if (!ball.cue && !ball.pocketed)
+            ++count;
+    }
+
+    return count;
+}
+
+static bool isInsidePocketZone(const PxVec3& ballPosition)
+{
+    for (const PxVec3& pocket : gPocketPositions)
+    {
+        const float dx = ballPosition.x - pocket.x;
+        const float dz = ballPosition.z - pocket.z;
+
+        if (dx * dx + dz * dz <= POCKET_RADIUS_SQ)
+            return true;
+    }
+
+    return false;
+}
+
+static void removePocketedBall(Ball& ball)
+{
+    if (!ball.actor)
+        return;
+
+    gScene->removeActor(*ball.actor);
+    ball.actor.reset();
+    ball.pocketed = true;
+}
+
+static void checkPocketedBalls()
+{
+    if (gGameOver)
+        return;
+
+    for (Ball& ball : gBalls)
+    {
+        if (ball.pocketed || !ball.actor)
+            continue;
+
+        const PxVec3 position = ball.actor->getGlobalPose().p;
+
+        if (isInsidePocketZone(position))
+        {
+            if (ball.cue)
+            {
+                removePocketedBall(ball);
+                gCueBallPocketed = true;
+                std::cout << "\nCue ball pocketed. Waiting for balls to stop.\n";
+                continue;
+            }
+
+            std::cout << "\nBall " << ball.number << " pocketed.\n";
+            removePocketedBall(ball);
+        }
+    }
+
+    if (!allBallsStopped())
+        return;
+
+    if (gCueBallPocketed)
+    {
+        gGameOver = true;
+        gPlayerWon = false;
+        std::cout << "\nDefeat: cue ball was pocketed.\n";
+        return;
+    }
+
+    if (remainingObjectBalls() == 0)
+    {
+        gGameOver = true;
+        gPlayerWon = true;
+        std::cout << "\nVictory: all object balls were pocketed.\n";
+    }
+}
+
+static void hitCueBall()
+{
+    if (gGameOver)
+        return;
+
+    if (!allBallsStopped())
+        return;
+
+    Ball* cueBall = getCueBall();
+
+    if (!cueBall || cueBall->pocketed || !cueBall->actor)
+        return;
+
+    PxVec3 direction(std::cos(gAimAngle), 0.0f, std::sin(gAimAngle));
+    direction.normalize();
+
+    cueBall->actor->wakeUp();
+    cueBall->actor->addForce(direction * gShotPower, PxForceMode::eIMPULSE, true);
+}
+
+static void printHud()
+{
+    std::cout
+        << "\rAim: " << static_cast<int>(gAimAngle * 180.0f / PI)
+        << " deg | Power: " << gShotPower
+        << " | Balls left: " << remainingObjectBalls()
+        << " | " << (allBallsStopped() ? "Ready" : "Moving")
+        << "        "
+        << std::flush;
+}
+
+static void handleInput()
+{
+#ifdef _WIN32
+    if (isVirtualKeyDown('A') || isVirtualKeyDown(VK_LEFT))
+        gAimAngle += AIM_CHANGE_PER_SECOND * TIME_STEP;
+
+    if (isVirtualKeyDown('D') || isVirtualKeyDown(VK_RIGHT))
+        gAimAngle -= AIM_CHANGE_PER_SECOND * TIME_STEP;
+
+    if (isVirtualKeyDown('W') || isVirtualKeyDown(VK_UP))
+        gShotPower = std::min(MAX_SHOT_POWER, gShotPower + SHOT_POWER_CHANGE_PER_SECOND * TIME_STEP);
+
+    if (isVirtualKeyDown('S') || isVirtualKeyDown(VK_DOWN))
+        gShotPower = std::max(MIN_SHOT_POWER, gShotPower - SHOT_POWER_CHANGE_PER_SECOND * TIME_STEP);
+
+    if (wasVirtualKeyPressed(VK_SPACE))
+        hitCueBall();
+
+    if (wasVirtualKeyPressed('R'))
+    {
+        resetBalls();
+        std::cout << "\nGame reset.\n";
+    }
+
+    if (wasVirtualKeyPressed('Q') || wasVirtualKeyPressed(VK_ESCAPE))
+        gQuitRequested = true;
+#else
+    const int key = readKeyNonBlocking();
+
+    if (key < 0)
+        return;
+
+    switch (key)
+    {
+    case 'a':
+    case 'A':
+        gAimAngle += 5.0f * PI / 180.0f;
+        break;
+
+    case 'd':
+    case 'D':
+        gAimAngle -= 5.0f * PI / 180.0f;
+        break;
+
+    case 'w':
+    case 'W':
+        gShotPower = std::min(MAX_SHOT_POWER, gShotPower + 0.10f);
+        break;
+
+    case 's':
+    case 'S':
+        gShotPower = std::max(MIN_SHOT_POWER, gShotPower - 0.10f);
+        break;
+
+    case ' ':
+        hitCueBall();
+        break;
+
+    case 'r':
+    case 'R':
+        resetBalls();
+        std::cout << "\nGame reset.\n";
+        break;
+
+    case 'q':
+    case 'Q':
+    case 27:
+        gQuitRequested = true;
+        break;
+
+    default:
+        break;
+    }
+#endif
 }
 
 static void initPhysX()
@@ -334,11 +651,81 @@ int main()
     std::cout << "PhysX billiards base simulation started.\n";
     std::cout << "Open PhysX Visual Debugger and connect to 127.0.0.1:5425.\n";
     std::cout << "Scene contains a 2.54 x 1.27 m table and 16 billiard balls.\n";
+    std::cout << "Controls: A/D aim, W/S power, Space hit, R reset, Q/Esc quit.\n";
 
-    for (int frame = 0; frame < 600; ++frame)
+    auto lastHud = std::chrono::steady_clock::now();
+
+    bool quit = false;
+
+    while (!quit)
     {
+        handleInput();
+
+        if (gQuitRequested)
+        {
+            quit = true;
+            break;
+        }
+
         gScene->simulate(TIME_STEP);
         gScene->fetchResults(true);
+
+        checkPocketedBalls();
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto hudDelta = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHud).count();
+
+        if (hudDelta > 250)
+        {
+            printHud();
+            lastHud = now;
+        }
+
+        if (gGameOver)
+        {
+            if (gPlayerWon)
+                std::cout << "\nGame over: victory.\n";
+            else
+                std::cout << "\nGame over.\n";
+
+            std::cout << "Press R to restart or Q/Esc to quit.\n";
+
+            while (true)
+            {
+#ifdef _WIN32
+                if (wasVirtualKeyPressed('R'))
+                {
+                    resetBalls();
+                    gGameOver = false;
+                    break;
+                }
+
+                if (wasVirtualKeyPressed('Q') || wasVirtualKeyPressed(VK_ESCAPE))
+                {
+                    quit = true;
+                    break;
+                }
+#else
+                const int key = readKeyNonBlocking();
+
+                if (key == 'r' || key == 'R')
+                {
+                    resetBalls();
+                    gGameOver = false;
+                    break;
+                }
+
+                if (key == 'q' || key == 'Q' || key == 27)
+                {
+                    quit = true;
+                    break;
+                }
+#endif
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            }
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
 
