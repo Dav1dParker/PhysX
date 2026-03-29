@@ -38,6 +38,8 @@ static PxMaterialPtr gBallMaterial;
 static PxMaterialPtr gRailMaterial;
 static PxMaterialPtr gCueMaterial;
 
+static PxRigidDynamicPtr gCueStick;
+
 static constexpr float PI = 3.14159265358979323846f;
 
 static constexpr float TABLE_LENGTH = 2.54f;
@@ -52,12 +54,19 @@ static constexpr float RAIL_THICKNESS = 0.08f;
 static constexpr float POCKET_RADIUS = 0.06f;
 static constexpr float POCKET_RADIUS_SQ = POCKET_RADIUS * POCKET_RADIUS;
 static constexpr float STOP_SPEED = 0.006f;
+static constexpr float STOP_ANGULAR_SPEED = 0.12f;
+static constexpr float BALL_HEIGHT_CORRECTION_THRESHOLD = 0.02f;
+static constexpr float RAIL_NUDGE_DISTANCE = 0.01f;
+static constexpr float RAIL_NUDGE_SPEED = 0.08f;
 
 static constexpr float MIN_SHOT_POWER = 0.20f;
 static constexpr float DEFAULT_SHOT_POWER = 1.10f;
 static constexpr float MAX_SHOT_POWER = 3.20f;
 static constexpr float SHOT_POWER_CHANGE_PER_SECOND = 1.60f;
 static constexpr float AIM_CHANGE_PER_SECOND = 120.0f * PI / 180.0f;
+
+static constexpr float CUE_HALF_LENGTH = 0.55f;
+static constexpr float CUE_RADIUS = 0.012f;
 
 static constexpr float TIME_STEP = 1.0f / 60.0f;
 
@@ -80,6 +89,9 @@ static bool  gGameOver = false;
 static bool  gPlayerWon = false;
 static bool  gCueBallPocketed = false;
 static bool  gQuitRequested = false;
+
+static bool  gCueAnimating = false;
+static float gCueAnimTime = 0.0f;
 
 static const char* storeName(const std::string& value)
 {
@@ -144,6 +156,38 @@ static bool isVirtualKeyDown(int virtualKey)
     return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
 }
 #endif
+
+static PxQuat rotationFromXAxisToDirection(PxVec3 direction)
+{
+    direction.y = 0.0f;
+
+    const float len = direction.magnitude();
+    if (len < 0.00001f)
+        return PxQuat(0.0f, PxVec3(0.0f, 1.0f, 0.0f));
+
+    direction *= 1.0f / len;
+
+    const PxVec3 xAxis(1.0f, 0.0f, 0.0f);
+    float dot = xAxis.dot(direction);
+    dot = std::max(-1.0f, std::min(1.0f, dot));
+
+    if (dot > 0.9999f)
+        return PxQuat(0.0f, PxVec3(0.0f, 1.0f, 0.0f));
+
+    if (dot < -0.9999f)
+        return PxQuat(PI, PxVec3(0.0f, 1.0f, 0.0f));
+
+    PxVec3 axis = xAxis.cross(direction);
+    const float axisLen = axis.magnitude();
+
+    if (axisLen < 0.00001f)
+        return PxQuat(0.0f, PxVec3(0.0f, 1.0f, 0.0f));
+
+    axis *= 1.0f / axisLen;
+
+    const float angle = std::acos(dot);
+    return PxQuat(angle, axis);
+}
 
 static PxRigidStaticPtr createStaticBox(
     const PxVec3& position,
@@ -259,6 +303,25 @@ static PxRigidDynamicPtr createBallActor(const PxVec3& position, int number, boo
     return actor;
 }
 
+static void createCueStick()
+{
+    gCueStick.reset(gPhysics->createRigidDynamic(PxTransform(PxVec3(-0.8f, BALL_RADIUS, 0.0f))));
+
+    PxShape* shape = PxRigidActorExt::createExclusiveShape(
+        *gCueStick,
+        PxCapsuleGeometry(CUE_RADIUS, CUE_HALF_LENGTH),
+        *gCueMaterial
+    );
+
+    shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, false);
+    shape->setFlag(PxShapeFlag::eSCENE_QUERY_SHAPE, false);
+
+    gCueStick->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
+    gCueStick->setName("Controlled_Cue_Stick");
+
+    gScene->addActor(*gCueStick);
+}
+
 static void removeAllBalls()
 {
     for (Ball& ball : gBalls)
@@ -280,6 +343,8 @@ static void resetBalls()
     gGameOver = false;
     gPlayerWon = false;
     gCueBallPocketed = false;
+    gCueAnimating = false;
+    gCueAnimTime = 0.0f;
 
     gAimAngle = 0.0f;
     gShotPower = DEFAULT_SHOT_POWER;
@@ -431,6 +496,193 @@ static void checkPocketedBalls()
     }
 }
 
+static void keepBallsOnTablePlane()
+{
+    for (Ball& ball : gBalls)
+    {
+        if (ball.pocketed || !ball.actor)
+            continue;
+
+        PxTransform pose = ball.actor->getGlobalPose();
+
+        if (std::fabs(pose.p.y - BALL_RADIUS) > BALL_HEIGHT_CORRECTION_THRESHOLD)
+        {
+            pose.p.y = BALL_RADIUS;
+            ball.actor->setGlobalPose(pose, true);
+        }
+
+        PxVec3 linearVelocity = ball.actor->getLinearVelocity();
+
+        if (std::fabs(linearVelocity.y) > 0.0001f)
+        {
+            linearVelocity.y = 0.0f;
+            ball.actor->setLinearVelocity(linearVelocity, true);
+        }
+
+        PxVec3 angularVelocity = ball.actor->getAngularVelocity();
+
+        if (std::fabs(angularVelocity.y) > 0.0001f)
+        {
+            angularVelocity.y = 0.0f;
+            ball.actor->setAngularVelocity(angularVelocity, true);
+        }
+    }
+}
+
+static void stopSlowBalls()
+{
+    for (Ball& ball : gBalls)
+    {
+        if (ball.pocketed || !ball.actor)
+            continue;
+
+        const PxVec3 linearVelocity = ball.actor->getLinearVelocity();
+        const PxVec3 angularVelocity = ball.actor->getAngularVelocity();
+
+        if (linearVelocity.magnitude() < STOP_SPEED && angularVelocity.magnitude() < STOP_ANGULAR_SPEED)
+        {
+            ball.actor->setLinearVelocity(PxVec3(0.0f), true);
+            ball.actor->setAngularVelocity(PxVec3(0.0f), true);
+            ball.actor->putToSleep();
+        }
+    }
+}
+
+static void stopWallCreep()
+{
+    const float halfL = TABLE_LENGTH * 0.5f;
+    const float halfW = TABLE_WIDTH * 0.5f;
+    const float railContactMargin = BALL_RADIUS + 0.01f;
+
+    for (Ball& ball : gBalls)
+    {
+        if (ball.pocketed || !ball.actor)
+            continue;
+
+        const PxVec3 position = ball.actor->getGlobalPose().p;
+        const bool nearShortRail = std::fabs(std::fabs(position.x) - halfL) < railContactMargin;
+        const bool nearLongRail = std::fabs(std::fabs(position.z) - halfW) < railContactMargin;
+
+        if (!nearShortRail && !nearLongRail)
+            continue;
+
+        const PxVec3 linearVelocity = ball.actor->getLinearVelocity();
+
+        if (linearVelocity.magnitude() < 0.03f)
+        {
+            ball.actor->setLinearVelocity(PxVec3(0.0f), true);
+            ball.actor->setAngularVelocity(PxVec3(0.0f), true);
+            ball.actor->putToSleep();
+        }
+    }
+}
+
+static void nudgeBallsAwayFromRails()
+{
+    const float halfL = TABLE_LENGTH * 0.5f;
+    const float halfW = TABLE_WIDTH * 0.5f;
+    const float maxX = halfL - BALL_RADIUS;
+    const float maxZ = halfW - BALL_RADIUS;
+
+    for (Ball& ball : gBalls)
+    {
+        if (ball.pocketed || !ball.actor)
+            continue;
+
+        PxTransform pose = ball.actor->getGlobalPose();
+        PxVec3 velocity = ball.actor->getLinearVelocity();
+        bool changed = false;
+
+        if (pose.p.x > maxX - RAIL_NUDGE_DISTANCE)
+        {
+            pose.p.x = std::min(pose.p.x, maxX);
+            velocity.x = std::min(velocity.x, -RAIL_NUDGE_SPEED);
+            changed = true;
+        }
+        else if (pose.p.x < -maxX + RAIL_NUDGE_DISTANCE)
+        {
+            pose.p.x = std::max(pose.p.x, -maxX);
+            velocity.x = std::max(velocity.x, RAIL_NUDGE_SPEED);
+            changed = true;
+        }
+
+        if (pose.p.z > maxZ - RAIL_NUDGE_DISTANCE)
+        {
+            pose.p.z = std::min(pose.p.z, maxZ);
+            velocity.z = std::min(velocity.z, -RAIL_NUDGE_SPEED);
+            changed = true;
+        }
+        else if (pose.p.z < -maxZ + RAIL_NUDGE_DISTANCE)
+        {
+            pose.p.z = std::max(pose.p.z, -maxZ);
+            velocity.z = std::max(velocity.z, RAIL_NUDGE_SPEED);
+            changed = true;
+        }
+
+        if (changed)
+        {
+            ball.actor->setGlobalPose(pose, true);
+            ball.actor->setLinearVelocity(velocity, true);
+            ball.actor->wakeUp();
+        }
+    }
+}
+
+static void updateCueStickPose(float dt)
+{
+    if (!gCueStick)
+        return;
+
+    Ball* cueBall = getCueBall();
+
+    if (!cueBall || cueBall->pocketed || !cueBall->actor || !allBallsStopped())
+    {
+        gCueAnimating = false;
+        gCueAnimTime = 0.0f;
+        gCueStick->setKinematicTarget(PxTransform(PxVec3(0.0f, -5.0f, 0.0f)));
+        return;
+    }
+
+    PxVec3 ballPosition = cueBall->actor->getGlobalPose().p;
+
+    PxVec3 direction(std::cos(gAimAngle), 0.0f, std::sin(gAimAngle));
+    direction.normalize();
+
+    float extraOffset = 0.14f;
+
+    if (gCueAnimating)
+    {
+        gCueAnimTime += dt;
+
+        const float total = 0.18f;
+        const float t = std::min(gCueAnimTime / total, 1.0f);
+
+        if (t < 0.5f)
+        {
+            const float k = t / 0.5f;
+            extraOffset = 0.14f * (1.0f - k) + 0.015f * k;
+        }
+        else
+        {
+            const float k = (t - 0.5f) / 0.5f;
+            extraOffset = 0.015f * (1.0f - k) + 0.14f * k;
+        }
+
+        if (gCueAnimTime >= total)
+        {
+            gCueAnimating = false;
+            gCueAnimTime = 0.0f;
+        }
+    }
+
+    PxVec3 cueCenter = ballPosition - direction * (BALL_RADIUS + CUE_HALF_LENGTH + extraOffset);
+    cueCenter.y = BALL_RADIUS;
+
+    const PxQuat rotation = rotationFromXAxisToDirection(direction);
+
+    gCueStick->setKinematicTarget(PxTransform(cueCenter, rotation));
+}
+
 static void hitCueBall()
 {
     if (gGameOver)
@@ -449,6 +701,9 @@ static void hitCueBall()
 
     cueBall->actor->wakeUp();
     cueBall->actor->addForce(direction * gShotPower, PxForceMode::eIMPULSE, true);
+
+    gCueAnimating = true;
+    gCueAnimTime = 0.0f;
 }
 
 static void printHud()
@@ -604,12 +859,19 @@ static void initPhysX()
     }
 
     createTable();
+    createCueStick();
     resetBalls();
 }
 
 static void cleanupPhysX()
 {
     removeAllBalls();
+
+    if (gCueStick)
+    {
+        gScene->removeActor(*gCueStick);
+        gCueStick.reset();
+    }
 
     if (gScene)
     {
@@ -670,7 +932,12 @@ int main()
         gScene->simulate(TIME_STEP);
         gScene->fetchResults(true);
 
+        keepBallsOnTablePlane();
+        nudgeBallsAwayFromRails();
+        stopWallCreep();
+        stopSlowBalls();
         checkPocketedBalls();
+        updateCueStickPose(TIME_STEP);
 
         const auto now = std::chrono::steady_clock::now();
         const auto hudDelta = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHud).count();
