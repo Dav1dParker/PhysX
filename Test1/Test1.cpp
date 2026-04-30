@@ -47,7 +47,7 @@ static constexpr float BULLET_DAMAGE = 20.0f;
 static constexpr float BULLET_IMPULSE = 550.0f;
 static constexpr float GRENADE_RADIUS = 0.16f;
 static constexpr float GRENADE_MASS = 0.45f;
-static constexpr float GRENADE_TTL = 3.0f;
+static constexpr float GRENADE_TTL = 2.0f;
 static constexpr float GRENADE_SPEED = 6.5f;
 static constexpr float GRENADE_UP_SPEED = 3.5f;
 static constexpr float EXPLOSION_RADIUS = 7.0f;
@@ -627,8 +627,6 @@ int main()
     initPhysX();
     createShooterScene();
 
-    std::cout << "PhysX shooter simulation started.\n";
-    std::cout << "Open PhysX Visual Debugger and connect to 127.0.0.1:5425.\n";
 
     while (!gQuitRequested)
     {
