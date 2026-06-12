@@ -32,8 +32,8 @@ static constexpr int FLAG_COLUMNS = 12;
 static constexpr int FLAG_ROWS = 8;
 static constexpr float FLAG_WIDTH = 4.0f;
 static constexpr float FLAG_HEIGHT = 2.4f;
-static constexpr float FLAG_TOP_Y = 3.2f;
-static constexpr float FLAG_Z = 0.0f;
+static constexpr float BANNER_TOP_Y = 3.4f;
+static constexpr float RECT_FLAG_TOP_Y = 3.2f;
 static constexpr float VERTEX_RADIUS = 0.035f;
 static constexpr float LINK_RADIUS = 0.012f;
 static constexpr float CLOTH_DAMPING = 0.992f;
@@ -46,6 +46,8 @@ struct ClothVertex
     PxVec3 previousPosition;
     PxVec3 acceleration;
     PxVec3 pinnedPosition;
+    int row = 0;
+    int column = 0;
     bool pinned = false;
     PxRigidDynamicPtr visual;
 };
@@ -58,14 +60,23 @@ struct ClothLink
     PxRigidDynamicPtr visual;
 };
 
+struct ClothPatch
+{
+    int firstVertex = 0;
+    int rows = 0;
+    int columns = 0;
+    int pinnedCount = 0;
+};
+
 static std::vector<PxRigidStaticPtr> gStaticActors;
 static std::vector<ClothVertex> gVertices;
 static std::vector<ClothLink> gLinks;
+static std::vector<ClothPatch> gCloths;
 static float gSimulationTime = 0.0f;
 
-static int vertexIndex(int row, int column)
+static int vertexIndex(const ClothPatch& cloth, int row, int column)
 {
-    return row * FLAG_COLUMNS + column;
+    return cloth.firstVertex + row * cloth.columns + column;
 }
 
 static PxQuat rotationFromXAxisToDirection(const PxVec3& direction)
@@ -157,29 +168,24 @@ static void integrateCloth(float dt)
 {
     PxVec3 wind = calculateWind(gSimulationTime);
 
-    for (int row = 0; row < FLAG_ROWS; ++row)
+    for (ClothVertex& vertex : gVertices)
     {
-        for (int column = 0; column < FLAG_COLUMNS; ++column)
+        if (vertex.pinned)
         {
-            ClothVertex& vertex = gVertices[vertexIndex(row, column)];
-
-            if (vertex.pinned)
-            {
-                vertex.position = vertex.pinnedPosition;
-                vertex.previousPosition = vertex.pinnedPosition;
-                continue;
-            }
-
-            float wave = std::sin(gSimulationTime * 3.0f + column * 0.7f + row * 0.25f);
-            vertex.acceleration = PxVec3(0.0f, -9.81f, 0.0f);
-            vertex.acceleration += (wind * (1.0f + 0.18f * wave)) / CLOTH_MASS;
-
-            PxVec3 velocity = (vertex.position - vertex.previousPosition) * CLOTH_DAMPING;
-            PxVec3 nextPosition = vertex.position + velocity + vertex.acceleration * dt * dt;
-
-            vertex.previousPosition = vertex.position;
-            vertex.position = nextPosition;
+            vertex.position = vertex.pinnedPosition;
+            vertex.previousPosition = vertex.pinnedPosition;
+            continue;
         }
+
+        float wave = std::sin(gSimulationTime * 3.0f + vertex.column * 0.7f + vertex.row * 0.25f);
+        vertex.acceleration = PxVec3(0.0f, -9.81f, 0.0f);
+        vertex.acceleration += (wind * (1.0f + 0.18f * wave)) / CLOTH_MASS;
+
+        PxVec3 velocity = (vertex.position - vertex.previousPosition) * CLOTH_DAMPING;
+        PxVec3 nextPosition = vertex.position + velocity + vertex.acceleration * dt * dt;
+
+        vertex.previousPosition = vertex.position;
+        vertex.position = nextPosition;
     }
 }
 
@@ -239,27 +245,73 @@ static void updateClothVisuals()
     }
 }
 
+static void addGridLinks(const ClothPatch& cloth)
+{
+    for (int row = 0; row < cloth.rows; ++row)
+    {
+        for (int column = 0; column < cloth.columns; ++column)
+        {
+            int current = vertexIndex(cloth, row, column);
+
+            if (column + 1 < cloth.columns)
+            {
+                addLink(current, vertexIndex(cloth, row, column + 1));
+            }
+            if (row + 1 < cloth.rows)
+            {
+                addLink(current, vertexIndex(cloth, row + 1, column));
+            }
+            if (column + 1 < cloth.columns && row + 1 < cloth.rows)
+            {
+                addLink(current, vertexIndex(cloth, row + 1, column + 1));
+            }
+            if (column > 0 && row + 1 < cloth.rows)
+            {
+                addLink(current, vertexIndex(cloth, row + 1, column - 1));
+            }
+            if (column + 2 < cloth.columns)
+            {
+                addLink(current, vertexIndex(cloth, row, column + 2));
+            }
+            if (row + 2 < cloth.rows)
+            {
+                addLink(current, vertexIndex(cloth, row + 2, column));
+            }
+        }
+    }
+}
+
 static void createBannerCloth()
 {
-    gVertices.clear();
-    gLinks.clear();
+    ClothPatch cloth;
+    cloth.firstVertex = static_cast<int>(gVertices.size());
+    cloth.rows = FLAG_ROWS;
+    cloth.columns = FLAG_COLUMNS;
+    cloth.pinnedCount = 2;
 
-    gVertices.reserve(FLAG_COLUMNS * FLAG_ROWS);
-
-    float leftX = -FLAG_WIDTH * 0.5f;
     float dx = FLAG_WIDTH / static_cast<float>(FLAG_COLUMNS - 1);
     float dy = FLAG_HEIGHT / static_cast<float>(FLAG_ROWS - 1);
 
     for (int row = 0; row < FLAG_ROWS; ++row)
     {
+        float vertical = static_cast<float>(row) / static_cast<float>(FLAG_ROWS - 1);
+        float rowWidth = FLAG_WIDTH * (1.0f - vertical);
+        rowWidth = std::max(rowWidth, 0.18f);
+        float leftX = -5.2f - rowWidth * 0.5f;
+
         for (int column = 0; column < FLAG_COLUMNS; ++column)
         {
-            PxVec3 position(leftX + column * dx, FLAG_TOP_Y - row * dy, FLAG_Z);
+            float horizontal = static_cast<float>(column) / static_cast<float>(FLAG_COLUMNS - 1);
+            float pointX = leftX + horizontal * rowWidth;
+            float pointY = BANNER_TOP_Y - row * dy;
+            PxVec3 position(pointX, pointY, 0.0f);
 
             ClothVertex vertex;
             vertex.position = position;
             vertex.previousPosition = position;
             vertex.pinnedPosition = position;
+            vertex.row = row;
+            vertex.column = column;
             vertex.pinned = (row == 0 && (column == 0 || column == FLAG_COLUMNS - 1));
             vertex.visual = createKinematicSphere(
                 position,
@@ -271,52 +323,70 @@ static void createBannerCloth()
         }
     }
 
+    addGridLinks(cloth);
+    gCloths.push_back(cloth);
+}
+
+static void createRectangularSidePinnedFlag()
+{
+    ClothPatch cloth;
+    cloth.firstVertex = static_cast<int>(gVertices.size());
+    cloth.rows = FLAG_ROWS;
+    cloth.columns = FLAG_COLUMNS;
+    cloth.pinnedCount = 2;
+
+    float leftX = 1.8f;
+    float dx = FLAG_WIDTH / static_cast<float>(FLAG_COLUMNS - 1);
+    float dy = FLAG_HEIGHT / static_cast<float>(FLAG_ROWS - 1);
+
     for (int row = 0; row < FLAG_ROWS; ++row)
     {
         for (int column = 0; column < FLAG_COLUMNS; ++column)
         {
-            int current = vertexIndex(row, column);
+            PxVec3 position(leftX + column * dx, RECT_FLAG_TOP_Y - row * dy, 0.0f);
 
-            if (column + 1 < FLAG_COLUMNS)
-            {
-                addLink(current, vertexIndex(row, column + 1));
-            }
-            if (row + 1 < FLAG_ROWS)
-            {
-                addLink(current, vertexIndex(row + 1, column));
-            }
-            if (column + 1 < FLAG_COLUMNS && row + 1 < FLAG_ROWS)
-            {
-                addLink(current, vertexIndex(row + 1, column + 1));
-            }
-            if (column > 0 && row + 1 < FLAG_ROWS)
-            {
-                addLink(current, vertexIndex(row + 1, column - 1));
-            }
-            if (column + 2 < FLAG_COLUMNS)
-            {
-                addLink(current, vertexIndex(row, column + 2));
-            }
-            if (row + 2 < FLAG_ROWS)
-            {
-                addLink(current, vertexIndex(row + 2, column));
-            }
+            ClothVertex vertex;
+            vertex.position = position;
+            vertex.previousPosition = position;
+            vertex.pinnedPosition = position;
+            vertex.row = row;
+            vertex.column = column;
+            vertex.pinned = (column == 0 && (row == 0 || row == FLAG_ROWS - 1));
+            vertex.visual = createKinematicSphere(
+                position,
+                vertex.pinned ? VERTEX_RADIUS * 1.7f : VERTEX_RADIUS,
+                vertex.pinned ? *gPinnedMaterial : *gClothMaterial
+            );
+
+            gVertices.push_back(std::move(vertex));
         }
     }
+
+    addGridLinks(cloth);
+    gCloths.push_back(cloth);
 }
 
 static void createScene()
 {
     gStaticActors.clear();
+    gVertices.clear();
+    gLinks.clear();
+    gCloths.clear();
 
-    gStaticActors.push_back(createStaticBox(PxVec3(0.0f, -0.05f, 0.0f), PxVec3(4.0f, 0.05f, 2.5f), *gGroundMaterial));
+    gVertices.reserve(FLAG_COLUMNS * FLAG_ROWS * 2);
 
-    float poleHeight = FLAG_TOP_Y + 0.25f;
-    gStaticActors.push_back(createStaticBox(PxVec3(-FLAG_WIDTH * 0.5f, poleHeight * 0.5f, -0.08f), PxVec3(0.04f, poleHeight * 0.5f, 0.04f), *gPoleMaterial));
-    gStaticActors.push_back(createStaticBox(PxVec3(FLAG_WIDTH * 0.5f, poleHeight * 0.5f, -0.08f), PxVec3(0.04f, poleHeight * 0.5f, 0.04f), *gPoleMaterial));
-    gStaticActors.push_back(createStaticBox(PxVec3(0.0f, FLAG_TOP_Y, -0.08f), PxVec3(FLAG_WIDTH * 0.5f + 0.08f, 0.035f, 0.035f), *gPoleMaterial));
+    gStaticActors.push_back(createStaticBox(PxVec3(0.0f, -0.05f, 0.0f), PxVec3(8.0f, 0.05f, 2.5f), *gGroundMaterial));
+
+    float bannerPoleHeight = BANNER_TOP_Y + 0.25f;
+    gStaticActors.push_back(createStaticBox(PxVec3(-7.2f, bannerPoleHeight * 0.5f, -0.08f), PxVec3(0.04f, bannerPoleHeight * 0.5f, 0.04f), *gPoleMaterial));
+    gStaticActors.push_back(createStaticBox(PxVec3(-3.2f, bannerPoleHeight * 0.5f, -0.08f), PxVec3(0.04f, bannerPoleHeight * 0.5f, 0.04f), *gPoleMaterial));
+    gStaticActors.push_back(createStaticBox(PxVec3(-5.2f, BANNER_TOP_Y, -0.08f), PxVec3(2.08f, 0.035f, 0.035f), *gPoleMaterial));
+
+    float flagPoleHeight = RECT_FLAG_TOP_Y + 0.25f;
+    gStaticActors.push_back(createStaticBox(PxVec3(1.8f, flagPoleHeight * 0.5f, -0.08f), PxVec3(0.04f, flagPoleHeight * 0.5f, 0.04f), *gPoleMaterial));
 
     createBannerCloth();
+    createRectangularSidePinnedFlag();
 }
 
 static void updateScene(float dt)
@@ -336,10 +406,7 @@ static void printStatus(int frame)
 
     PxVec3 wind = calculateWind(gSimulationTime);
     std::cout << std::fixed << std::setprecision(2)
-              << "t=" << gSimulationTime
-              << "s | vertices=" << gVertices.size()
-              << " | pinned=2"
-              << " | wind=(" << wind.x << ", " << wind.y << ", " << wind.z << ")"
+              << " wind=(" << wind.x << ", " << wind.y << ", " << wind.z << ")"
               << " | strength=" << wind.magnitude()
               << '\n';
 }
@@ -389,6 +456,7 @@ static void cleanupPhysX()
 {
     gLinks.clear();
     gVertices.clear();
+    gCloths.clear();
     gStaticActors.clear();
 
     gGroundMaterial.reset();
@@ -417,11 +485,6 @@ int main()
 {
     initPhysX();
     createScene();
-
-    std::cout << "PhysX banner cloth simulation started.\n";
-    std::cout << "Open PhysX Visual Debugger and connect to 127.0.0.1:5425.\n";
-    std::cout << "Flag mesh: " << FLAG_COLUMNS << " x " << FLAG_ROWS << " = "
-              << FLAG_COLUMNS * FLAG_ROWS << " vertices. Top left and top right vertices are pinned.\n";
 
     for (int frame = 0; frame < 1800; ++frame)
     {
