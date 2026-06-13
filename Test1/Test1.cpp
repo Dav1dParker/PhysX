@@ -1,12 +1,24 @@
+#define NOMINMAX
+
 #include "PxPhysicsAPI.h"
 #include "deleters.h"
 
+#include "NvCloth/Callbacks.h"
+#include "NvCloth/Cloth.h"
+#include "NvCloth/Factory.h"
+#include "NvCloth/Fabric.h"
+#include "NvCloth/Solver.h"
+#include "NvClothExt/ClothFabricCooker.h"
+#include "NvClothExt/ClothMeshDesc.h"
+#include "snippetrender/SnippetCamera.h"
+#include "snippetrender/SnippetRender.h"
+
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
-#include <thread>
+#include <memory>
+#include <string>
 #include <vector>
 
 using namespace physx;
@@ -23,9 +35,6 @@ static PxPvdTransportPtr gTransport;
 
 static PxMaterialPtr gGroundMaterial;
 static PxMaterialPtr gPoleMaterial;
-static PxMaterialPtr gClothMaterial;
-static PxMaterialPtr gPinnedMaterial;
-static PxMaterialPtr gLinkMaterial;
 
 static constexpr float TIME_STEP = 1.0f / 60.0f;
 static constexpr int FLAG_COLUMNS = 12;
@@ -34,69 +43,51 @@ static constexpr float FLAG_WIDTH = 4.0f;
 static constexpr float FLAG_HEIGHT = 2.4f;
 static constexpr float BANNER_TOP_Y = 3.4f;
 static constexpr float RECT_FLAG_TOP_Y = 3.2f;
-static constexpr float VERTEX_RADIUS = 0.035f;
-static constexpr float LINK_RADIUS = 0.012f;
-static constexpr float CLOTH_DAMPING = 0.992f;
-static constexpr float CLOTH_MASS = 0.08f;
-static constexpr int SOLVER_ITERATIONS = 10;
+static constexpr float WIND_POWER_MIN = 0.0f;
+static constexpr float WIND_POWER_MAX = 2.0f;
+static constexpr float WIND_POWER_STEP = 0.1f;
 
-struct ClothVertex
+struct NvClothAssertHandler final : nv::cloth::PxAssertHandler
 {
-    PxVec3 position;
-    PxVec3 previousPosition;
-    PxVec3 acceleration;
-    PxVec3 pinnedPosition;
-    int row = 0;
-    int column = 0;
-    bool pinned = false;
-    PxRigidDynamicPtr visual;
-};
-
-struct ClothLink
-{
-    int a = 0;
-    int b = 0;
-    float restLength = 0.0f;
-    PxRigidDynamicPtr visual;
+    void operator()(const char* exp, const char* file, int line, bool& ignore) override
+    {
+        std::cerr << "NvCloth assert: " << exp << " (" << file << ':' << line << ")\n";
+        ignore = false;
+    }
 };
 
 struct ClothPatch
 {
-    int firstVertex = 0;
+    std::string name;
     int rows = 0;
     int columns = 0;
-    int pinnedCount = 0;
+    std::vector<PxVec3> points;
+    std::vector<float> invMasses;
+    std::vector<PxVec4> particles;
+    std::vector<PxU32> indices;
+    std::vector<PxU32> quads;
+    nv::cloth::Fabric* fabric = nullptr;
+    nv::cloth::Cloth* cloth = nullptr;
 };
 
 static std::vector<PxRigidStaticPtr> gStaticActors;
-static std::vector<ClothVertex> gVertices;
-static std::vector<ClothLink> gLinks;
 static std::vector<ClothPatch> gCloths;
+static NvClothAssertHandler gNvClothAssertHandler;
+static nv::cloth::Factory* gClothFactory = nullptr;
+static nv::cloth::Solver* gClothSolver = nullptr;
+static Snippets::Camera* gCamera = nullptr;
 static float gSimulationTime = 0.0f;
+static float gWindPower = 1.0f;
+static int gFrame = 0;
 
 static int vertexIndex(const ClothPatch& cloth, int row, int column)
 {
-    return cloth.firstVertex + row * cloth.columns + column;
+    return row * cloth.columns + column;
 }
 
-static PxQuat rotationFromXAxisToDirection(const PxVec3& direction)
+static nv::cloth::Range<const PxVec4> constRange(const std::vector<PxVec4>& values)
 {
-    PxVec3 xAxis(1.0f, 0.0f, 0.0f);
-    PxVec3 unitDirection = direction.getNormalized();
-    float dot = PxClamp(xAxis.dot(unitDirection), -1.0f, 1.0f);
-
-    if (dot > 0.9999f)
-    {
-        return PxQuat(PxIdentity);
-    }
-
-    if (dot < -0.9999f)
-    {
-        return PxQuat(PxPi, PxVec3(0.0f, 1.0f, 0.0f));
-    }
-
-    PxVec3 axis = xAxis.cross(unitDirection).getNormalized();
-    return PxQuat(std::acos(dot), axis);
+    return nv::cloth::Range<const PxVec4>(values.data(), values.data() + values.size());
 }
 
 static PxRigidStaticPtr createStaticBox(const PxVec3& position, const PxVec3& halfSize, PxMaterial& material)
@@ -105,54 +96,6 @@ static PxRigidStaticPtr createStaticBox(const PxVec3& position, const PxVec3& ha
     PxRigidActorExt::createExclusiveShape(*actor, PxBoxGeometry(halfSize), material);
     gScene->addActor(*actor);
     return actor;
-}
-
-static PxRigidDynamicPtr createKinematicSphere(const PxVec3& position, float radius, PxMaterial& material)
-{
-    PxRigidDynamicPtr actor(gPhysics->createRigidDynamic(PxTransform(position)));
-    PxRigidActorExt::createExclusiveShape(*actor, PxSphereGeometry(radius), material);
-    actor->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
-    actor->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
-    gScene->addActor(*actor);
-    return actor;
-}
-
-static PxRigidDynamicPtr createKinematicCapsule(const PxVec3& a, const PxVec3& b, float radius, PxMaterial& material)
-{
-    PxVec3 delta = b - a;
-    float length = std::max(delta.magnitude(), 0.001f);
-    PxTransform transform((a + b) * 0.5f, rotationFromXAxisToDirection(delta));
-
-    PxRigidDynamicPtr actor(gPhysics->createRigidDynamic(transform));
-    PxRigidActorExt::createExclusiveShape(*actor, PxCapsuleGeometry(radius, length * 0.5f), material);
-    actor->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
-    actor->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
-    gScene->addActor(*actor);
-    return actor;
-}
-
-static void updateKinematicCapsule(PxRigidDynamic& actor, const PxVec3& a, const PxVec3& b)
-{
-    PxVec3 delta = b - a;
-    float length = std::max(delta.magnitude(), 0.001f);
-
-    PxShape* shape = nullptr;
-    if (actor.getShapes(&shape, 1) == 1 && shape)
-    {
-        shape->setGeometry(PxCapsuleGeometry(LINK_RADIUS, length * 0.5f));
-    }
-
-    actor.setKinematicTarget(PxTransform((a + b) * 0.5f, rotationFromXAxisToDirection(delta)));
-}
-
-static void addLink(int a, int b)
-{
-    ClothLink link;
-    link.a = a;
-    link.b = b;
-    link.restLength = (gVertices[b].position - gVertices[a].position).magnitude();
-    link.visual = createKinematicCapsule(gVertices[a].position, gVertices[b].position, LINK_RADIUS, *gLinkMaterial);
-    gLinks.push_back(std::move(link));
 }
 
 static PxVec3 calculateWind(float time)
@@ -164,176 +107,74 @@ static PxVec3 calculateWind(float time)
     return PxVec3(std::cos(horizontalAngle), 0.12f * std::sin(time * 1.7f), std::sin(horizontalAngle)) * strength;
 }
 
-static void integrateCloth(float dt)
+static void appendGridGeometry(ClothPatch& cloth)
 {
-    PxVec3 wind = calculateWind(gSimulationTime);
-
-    for (ClothVertex& vertex : gVertices)
+    for (int row = 0; row + 1 < cloth.rows; ++row)
     {
-        if (vertex.pinned)
+        for (int column = 0; column + 1 < cloth.columns; ++column)
         {
-            vertex.position = vertex.pinnedPosition;
-            vertex.previousPosition = vertex.pinnedPosition;
-            continue;
-        }
+            PxU32 a = static_cast<PxU32>(vertexIndex(cloth, row, column));
+            PxU32 b = static_cast<PxU32>(vertexIndex(cloth, row, column + 1));
+            PxU32 c = static_cast<PxU32>(vertexIndex(cloth, row + 1, column));
+            PxU32 d = static_cast<PxU32>(vertexIndex(cloth, row + 1, column + 1));
 
-        float wave = std::sin(gSimulationTime * 3.0f + vertex.column * 0.7f + vertex.row * 0.25f);
-        vertex.acceleration = PxVec3(0.0f, -9.81f, 0.0f);
-        vertex.acceleration += (wind * (1.0f + 0.18f * wave)) / CLOTH_MASS;
+            cloth.indices.push_back(a);
+            cloth.indices.push_back(c);
+            cloth.indices.push_back(b);
 
-        PxVec3 velocity = (vertex.position - vertex.previousPosition) * CLOTH_DAMPING;
-        PxVec3 nextPosition = vertex.position + velocity + vertex.acceleration * dt * dt;
+            cloth.indices.push_back(b);
+            cloth.indices.push_back(c);
+            cloth.indices.push_back(d);
 
-        vertex.previousPosition = vertex.position;
-        vertex.position = nextPosition;
-    }
-}
-
-static void satisfyConstraints()
-{
-    for (int iteration = 0; iteration < SOLVER_ITERATIONS; ++iteration)
-    {
-        for (const ClothLink& link : gLinks)
-        {
-            ClothVertex& a = gVertices[link.a];
-            ClothVertex& b = gVertices[link.b];
-
-            PxVec3 delta = b.position - a.position;
-            float length = delta.magnitude();
-            if (length < 0.0001f)
-            {
-                continue;
-            }
-
-            PxVec3 correction = delta * ((length - link.restLength) / length);
-
-            if (!a.pinned && !b.pinned)
-            {
-                a.position += correction * 0.5f;
-                b.position -= correction * 0.5f;
-            }
-            else if (a.pinned && !b.pinned)
-            {
-                b.position -= correction;
-            }
-            else if (!a.pinned && b.pinned)
-            {
-                a.position += correction;
-            }
-        }
-
-        for (ClothVertex& vertex : gVertices)
-        {
-            if (vertex.pinned)
-            {
-                vertex.position = vertex.pinnedPosition;
-            }
+            cloth.quads.push_back(a);
+            cloth.quads.push_back(b);
+            cloth.quads.push_back(d);
+            cloth.quads.push_back(c);
         }
     }
 }
 
-static void updateClothVisuals()
+static void addParticle(ClothPatch& cloth, const PxVec3& position, bool pinned)
 {
-    for (ClothVertex& vertex : gVertices)
-    {
-        vertex.visual->setKinematicTarget(PxTransform(vertex.position));
-    }
-
-    for (ClothLink& link : gLinks)
-    {
-        updateKinematicCapsule(*link.visual, gVertices[link.a].position, gVertices[link.b].position);
-    }
+    cloth.points.push_back(position);
+    cloth.invMasses.push_back(pinned ? 0.0f : 1.0f);
+    cloth.particles.emplace_back(position.x, position.y, position.z, pinned ? 0.0f : 1.0f);
 }
 
-static void addGridLinks(const ClothPatch& cloth)
-{
-    for (int row = 0; row < cloth.rows; ++row)
-    {
-        for (int column = 0; column < cloth.columns; ++column)
-        {
-            int current = vertexIndex(cloth, row, column);
-
-            if (column + 1 < cloth.columns)
-            {
-                addLink(current, vertexIndex(cloth, row, column + 1));
-            }
-            if (row + 1 < cloth.rows)
-            {
-                addLink(current, vertexIndex(cloth, row + 1, column));
-            }
-            if (column + 1 < cloth.columns && row + 1 < cloth.rows)
-            {
-                addLink(current, vertexIndex(cloth, row + 1, column + 1));
-            }
-            if (column > 0 && row + 1 < cloth.rows)
-            {
-                addLink(current, vertexIndex(cloth, row + 1, column - 1));
-            }
-            if (column + 2 < cloth.columns)
-            {
-                addLink(current, vertexIndex(cloth, row, column + 2));
-            }
-            if (row + 2 < cloth.rows)
-            {
-                addLink(current, vertexIndex(cloth, row + 2, column));
-            }
-        }
-    }
-}
-
-static void createBannerCloth()
+static ClothPatch makeBannerCloth()
 {
     ClothPatch cloth;
-    cloth.firstVertex = static_cast<int>(gVertices.size());
+    cloth.name = "banner";
     cloth.rows = FLAG_ROWS;
     cloth.columns = FLAG_COLUMNS;
-    cloth.pinnedCount = 2;
 
-    float dx = FLAG_WIDTH / static_cast<float>(FLAG_COLUMNS - 1);
     float dy = FLAG_HEIGHT / static_cast<float>(FLAG_ROWS - 1);
 
     for (int row = 0; row < FLAG_ROWS; ++row)
     {
         float vertical = static_cast<float>(row) / static_cast<float>(FLAG_ROWS - 1);
-        float rowWidth = FLAG_WIDTH * (1.0f - vertical);
-        rowWidth = std::max(rowWidth, 0.18f);
+        float rowWidth = std::max(FLAG_WIDTH * (1.0f - vertical), 0.18f);
         float leftX = -5.2f - rowWidth * 0.5f;
 
         for (int column = 0; column < FLAG_COLUMNS; ++column)
         {
             float horizontal = static_cast<float>(column) / static_cast<float>(FLAG_COLUMNS - 1);
-            float pointX = leftX + horizontal * rowWidth;
-            float pointY = BANNER_TOP_Y - row * dy;
-            PxVec3 position(pointX, pointY, 0.0f);
-
-            ClothVertex vertex;
-            vertex.position = position;
-            vertex.previousPosition = position;
-            vertex.pinnedPosition = position;
-            vertex.row = row;
-            vertex.column = column;
-            vertex.pinned = (row == 0 && (column == 0 || column == FLAG_COLUMNS - 1));
-            vertex.visual = createKinematicSphere(
-                position,
-                vertex.pinned ? VERTEX_RADIUS * 1.7f : VERTEX_RADIUS,
-                vertex.pinned ? *gPinnedMaterial : *gClothMaterial
-            );
-
-            gVertices.push_back(std::move(vertex));
+            PxVec3 position(leftX + horizontal * rowWidth, BANNER_TOP_Y - row * dy, 0.0f);
+            bool pinned = (row == 0 && (column == 0 || column == FLAG_COLUMNS - 1));
+            addParticle(cloth, position, pinned);
         }
     }
 
-    addGridLinks(cloth);
-    gCloths.push_back(cloth);
+    appendGridGeometry(cloth);
+    return cloth;
 }
 
-static void createRectangularSidePinnedFlag()
+static ClothPatch makeRectangularSidePinnedFlag()
 {
     ClothPatch cloth;
-    cloth.firstVertex = static_cast<int>(gVertices.size());
+    cloth.name = "rectangular flag";
     cloth.rows = FLAG_ROWS;
     cloth.columns = FLAG_COLUMNS;
-    cloth.pinnedCount = 2;
 
     float leftX = 1.8f;
     float dx = FLAG_WIDTH / static_cast<float>(FLAG_COLUMNS - 1);
@@ -344,36 +185,108 @@ static void createRectangularSidePinnedFlag()
         for (int column = 0; column < FLAG_COLUMNS; ++column)
         {
             PxVec3 position(leftX + column * dx, RECT_FLAG_TOP_Y - row * dy, 0.0f);
-
-            ClothVertex vertex;
-            vertex.position = position;
-            vertex.previousPosition = position;
-            vertex.pinnedPosition = position;
-            vertex.row = row;
-            vertex.column = column;
-            vertex.pinned = (column == 0 && (row == 0 || row == FLAG_ROWS - 1));
-            vertex.visual = createKinematicSphere(
-                position,
-                vertex.pinned ? VERTEX_RADIUS * 1.7f : VERTEX_RADIUS,
-                vertex.pinned ? *gPinnedMaterial : *gClothMaterial
-            );
-
-            gVertices.push_back(std::move(vertex));
+            bool pinned = (column == 0 && (row == 0 || row == FLAG_ROWS - 1));
+            addParticle(cloth, position, pinned);
         }
     }
 
-    addGridLinks(cloth);
-    gCloths.push_back(cloth);
+    appendGridGeometry(cloth);
+    return cloth;
+}
+
+static void cookCloth(ClothPatch& cloth)
+{
+    nv::cloth::ClothMeshDesc meshDesc;
+    meshDesc.points.data = cloth.points.data();
+    meshDesc.points.count = static_cast<PxU32>(cloth.points.size());
+    meshDesc.points.stride = sizeof(PxVec3);
+    meshDesc.invMasses.data = cloth.invMasses.data();
+    meshDesc.invMasses.count = static_cast<PxU32>(cloth.invMasses.size());
+    meshDesc.invMasses.stride = sizeof(float);
+    meshDesc.quads.data = cloth.quads.data();
+    meshDesc.quads.count = static_cast<PxU32>(cloth.quads.size() / 4);
+    meshDesc.quads.stride = sizeof(PxU32) * 4;
+
+    cloth.fabric = NvClothCookFabricFromMesh(gClothFactory, meshDesc, PxVec3(0.0f, -1.0f, 0.0f), nullptr, false);
+
+    cloth.cloth = gClothFactory->createCloth(constRange(cloth.particles), *cloth.fabric);
+
+    cloth.cloth->setGravity(PxVec3(0.0f, -9.81f, 0.0f));
+    cloth.cloth->setDamping(PxVec3(0.12f, 0.12f, 0.12f));
+    cloth.cloth->setSolverFrequency(600.0f);
+    cloth.cloth->setStiffnessFrequency(60.0f);
+    cloth.cloth->setTetherConstraintScale(1.1f);
+    cloth.cloth->setTetherConstraintStiffness(0.7f);
+    cloth.cloth->setDragCoefficient(0.35f);
+    cloth.cloth->setLiftCoefficient(0.05f);
+    cloth.cloth->setFluidDensity(1.0f);
+    cloth.cloth->setSelfCollisionDistance(0.0f);
+    cloth.cloth->setSelfCollisionStiffness(0.0f);
+    cloth.cloth->clearInertia();
+
+    std::vector<nv::cloth::PhaseConfig> phaseConfigs;
+    phaseConfigs.reserve(cloth.fabric->getNumPhases());
+    for (PxU32 i = 0; i < cloth.fabric->getNumPhases(); ++i)
+    {
+        nv::cloth::PhaseConfig config(static_cast<uint16_t>(i));
+        config.mStiffness = 1.0f;
+        config.mStiffnessMultiplier = 1.0f;
+        config.mCompressionLimit = 1.0f;
+        config.mStretchLimit = 1.05f;
+        phaseConfigs.push_back(config);
+    }
+    cloth.cloth->setPhaseConfig(nv::cloth::Range<const nv::cloth::PhaseConfig>(phaseConfigs.data(), phaseConfigs.data() + phaseConfigs.size()));
+
+    gClothSolver->addCloth(cloth.cloth);
+}
+
+static void initNvCloth()
+{
+    nv::cloth::InitializeNvCloth(&gAllocator, &gErrorCallback, &gNvClothAssertHandler, nullptr);
+
+    gClothFactory = NvClothCreateFactoryCPU();
+    gClothSolver = gClothFactory->createSolver();
+}
+
+static void releaseCloth(ClothPatch& cloth)
+{
+    if (gClothSolver && cloth.cloth)
+    {
+        gClothSolver->removeCloth(cloth.cloth);
+    }
+
+    delete cloth.cloth;
+    cloth.cloth = nullptr;
+
+    if (cloth.fabric)
+    {
+        cloth.fabric->decRefCount();
+        cloth.fabric = nullptr;
+    }
+}
+
+static void cleanupNvCloth()
+{
+    for (ClothPatch& cloth : gCloths)
+    {
+        releaseCloth(cloth);
+    }
+    gCloths.clear();
+
+    delete gClothSolver;
+    gClothSolver = nullptr;
+
+    if (gClothFactory)
+    {
+        NvClothDestroyFactory(gClothFactory);
+        gClothFactory = nullptr;
+    }
 }
 
 static void createScene()
 {
     gStaticActors.clear();
-    gVertices.clear();
-    gLinks.clear();
     gCloths.clear();
-
-    gVertices.reserve(FLAG_COLUMNS * FLAG_ROWS * 2);
 
     gStaticActors.push_back(createStaticBox(PxVec3(0.0f, -0.05f, 0.0f), PxVec3(8.0f, 0.05f, 2.5f), *gGroundMaterial));
 
@@ -385,30 +298,136 @@ static void createScene()
     float flagPoleHeight = RECT_FLAG_TOP_Y + 0.25f;
     gStaticActors.push_back(createStaticBox(PxVec3(1.8f, flagPoleHeight * 0.5f, -0.08f), PxVec3(0.04f, flagPoleHeight * 0.5f, 0.04f), *gPoleMaterial));
 
-    createBannerCloth();
-    createRectangularSidePinnedFlag();
+    gCloths.push_back(makeBannerCloth());
+    gCloths.push_back(makeRectangularSidePinnedFlag());
+
+    for (ClothPatch& cloth : gCloths)
+    {
+        cookCloth(cloth);
+    }
 }
 
 static void updateScene(float dt)
 {
     gSimulationTime += dt;
-    integrateCloth(dt);
-    satisfyConstraints();
-    updateClothVisuals();
+    PxVec3 wind = calculateWind(gSimulationTime) * gWindPower;
+
+    for (ClothPatch& cloth : gCloths)
+    {
+        cloth.cloth->setWindVelocity(wind);
+        cloth.cloth->wakeUp();
+    }
+
+    if (gClothSolver->beginSimulation(dt))
+    {
+        int chunkCount = gClothSolver->getSimulationChunkCount();
+        for (int i = 0; i < chunkCount; ++i)
+        {
+            gClothSolver->simulateChunk(i);
+        }
+        gClothSolver->endSimulation();
+    }
+
+    gScene->simulate(dt);
+    gScene->fetchResults(true);
 }
 
-static void printStatus(int frame)
+static void printStatus()
 {
-    if (frame % 30 != 0)
+    if (gFrame % 30 != 0)
     {
         return;
     }
 
-    PxVec3 wind = calculateWind(gSimulationTime);
+    PxVec3 wind = calculateWind(gSimulationTime) * gWindPower;
     std::cout << std::fixed << std::setprecision(2)
               << " wind=(" << wind.x << ", " << wind.y << ", " << wind.z << ")"
               << " | strength=" << wind.magnitude()
+              << " | power=" << gWindPower
               << '\n';
+}
+
+static void renderCallback()
+{
+    updateScene(TIME_STEP);
+    printStatus();
+    ++gFrame;
+
+    Snippets::startRender(gCamera);
+
+    std::vector<PxRigidActor*> actors;
+    actors.reserve(gStaticActors.size());
+    for (const PxRigidStaticPtr& actor : gStaticActors)
+    {
+        actors.push_back(actor.get());
+    }
+
+    if (!actors.empty())
+    {
+        Snippets::renderActors(actors.data(), static_cast<PxU32>(actors.size()), true, PxVec3(0.55f, 0.55f, 0.55f));
+    }
+
+    for (const ClothPatch& cloth : gCloths)
+    {
+        nv::cloth::MappedRange<const PxVec4> particles = nv::cloth::readCurrentParticles(*cloth.cloth);
+        Snippets::renderMesh(
+            static_cast<PxU32>(particles.size()),
+            particles.begin(),
+            static_cast<PxU32>(cloth.indices.size() / 3),
+            cloth.indices.data(),
+            cloth.name == "banner" ? PxVec3(0.18f, 0.65f, 0.28f) : PxVec3(0.14f, 0.46f, 0.95f),
+            nullptr,
+            false
+        );
+    }
+
+    Snippets::print("NvCloth CPU cloth demo");
+    Snippets::finishRender();
+}
+
+static void keyboardCallback(unsigned char key, const PxTransform&)
+{
+    if (key == 27)
+    {
+        glutLeaveMainLoop();
+    }
+    else if (key == '1')
+    {
+        gWindPower = std::max(WIND_POWER_MIN, gWindPower - WIND_POWER_STEP);
+        std::cout << "wind power=" << std::fixed << std::setprecision(1) << gWindPower << '\n';
+    }
+    else if (key == '2')
+    {
+        gWindPower = std::min(WIND_POWER_MAX, gWindPower + WIND_POWER_STEP);
+        std::cout << "wind power=" << std::fixed << std::setprecision(1) << gWindPower << '\n';
+    }
+}
+
+static void exitCallback()
+{
+    cleanupNvCloth();
+
+    delete gCamera;
+    gCamera = nullptr;
+
+    gStaticActors.clear();
+    gGroundMaterial.reset();
+    gPoleMaterial.reset();
+
+    gScene.reset();
+    gDispatcher.reset();
+
+    PxCloseExtensions();
+    gPhysics.reset();
+
+    if (gPvd)
+    {
+        gPvd->disconnect();
+    }
+
+    gPvd.reset();
+    gTransport.reset();
+    gFoundation.reset();
 }
 
 static void initPhysX()
@@ -425,6 +444,7 @@ static void initPhysX()
 
     PxTolerancesScale scale;
     gPhysics.reset(PxCreatePhysics(PX_PHYSICS_VERSION, *gFoundation, scale, true, gPvd.get()));
+
     PxInitExtensions(*gPhysics, gPvd.get());
 
     PxSceneDesc sceneDesc(gPhysics->getTolerancesScale());
@@ -447,54 +467,17 @@ static void initPhysX()
 
     gGroundMaterial.reset(gPhysics->createMaterial(0.7f, 0.7f, 0.1f));
     gPoleMaterial.reset(gPhysics->createMaterial(0.5f, 0.5f, 0.2f));
-    gClothMaterial.reset(gPhysics->createMaterial(0.25f, 0.25f, 0.05f));
-    gPinnedMaterial.reset(gPhysics->createMaterial(0.25f, 0.25f, 0.05f));
-    gLinkMaterial.reset(gPhysics->createMaterial(0.25f, 0.25f, 0.05f));
-}
-
-static void cleanupPhysX()
-{
-    gLinks.clear();
-    gVertices.clear();
-    gCloths.clear();
-    gStaticActors.clear();
-
-    gGroundMaterial.reset();
-    gPoleMaterial.reset();
-    gClothMaterial.reset();
-    gPinnedMaterial.reset();
-    gLinkMaterial.reset();
-
-    gScene.reset();
-    gDispatcher.reset();
-
-    PxCloseExtensions();
-    gPhysics.reset();
-
-    if (gPvd)
-    {
-        gPvd->disconnect();
-    }
-
-    gPvd.reset();
-    gTransport.reset();
-    gFoundation.reset();
 }
 
 int main()
 {
     initPhysX();
+    initNvCloth();
     createScene();
 
-    for (int frame = 0; frame < 1800; ++frame)
-    {
-        updateScene(TIME_STEP);
-        gScene->simulate(TIME_STEP);
-        gScene->fetchResults(true);
-        printStatus(frame);
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
-    }
+    gCamera = new Snippets::Camera(PxVec3(-1.8f, 2.3f, 9.0f), PxVec3(0.1f, -0.15f, -1.0f));
+    Snippets::setupDefault("NvCloth Flags", gCamera, keyboardCallback, renderCallback, exitCallback);
+    glutMainLoop();
 
-    cleanupPhysX();
     return 0;
 }
